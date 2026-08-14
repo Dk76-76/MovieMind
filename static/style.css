@@ -28,6 +28,7 @@ body {
     color: var(--text);
     font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     line-height: 1.5;
+    transition: background-color .25s ease, color .25s ease;
 }
 
 button,
@@ -568,6 +569,7 @@ img {
         opacity: 0;
         transform: translateY(15px) scale(.98);
     }
+
     to {
         opacity: 1;
         transform: translateY(0) scale(1);
@@ -756,7 +758,9 @@ img {
 }
 
 @keyframes spin {
-    to { transform: rotate(360deg); }
+    to {
+        transform: rotate(360deg);
+    }
 }
 
 /* TOAST */
@@ -956,8 +960,9 @@ img {
         align-items: stretch;
     }
 }
+
 /* =========================================================
-   MOVIEMIND FINAL MODAL RECOMMENDATION OVERRIDES
+   MODAL RECOMMENDATIONS
    ========================================================= */
 
 .modal-panel > .recommendations-section,
@@ -1042,11 +1047,210 @@ img {
     font-size: 10px;
 }
 
-/* Recommendation loading cards inside the modal */
 .modal-panel > .recommendations-section #recommendationGrid .skeleton,
 .modal-panel > #recommendations #recommendationGrid .skeleton {
     min-width: 0;
 }
+
+/* =========================================================
+   DARK MODE — ONLY ADDITION
+   ========================================================= */
+
+html.dark-mode {
+    color-scheme: dark;
+
+    --bg: #0b0d12;
+    --bg-soft: #12151c;
+    --panel: #151922;
+    --text: #f4f5f7;
+    --muted: #a1a7b3;
+    --border: #292e39;
+    --accent: #7668ff;
+    --accent-dark: #6254ed;
+    --accent-soft: #211e3c;
+    --gold: #fbbf24;
+    --shadow: 0 16px 50px rgba(0, 0, 0, 0.35);
+    --shadow-card: 0 12px 30px rgba(0, 0, 0, 0.38);
+}
+
+html.dark-mode body {
+    background: var(--bg);
+    color: var(--text);
+}
+
+html.dark-mode .navbar {
+    background: rgba(11, 13, 18, 0.90);
+    border-bottom-color: rgba(41, 46, 57, 0.9);
+}
+
+html.dark-mode .nav-links button {
+    color: #b8beca;
+}
+
+html.dark-mode .nav-links button:hover {
+    background: var(--bg-soft);
+    color: var(--accent);
+}
+
+html.dark-mode .mobile-menu {
+    color: var(--text);
+    background: var(--bg-soft);
+}
+
+html.dark-mode .hero-inner {
+    background:
+        radial-gradient(circle at 90% 20%, rgba(119, 102, 255, 0.22), transparent 30%),
+        radial-gradient(circle at 70% 90%, rgba(102, 210, 255, 0.10), transparent 28%),
+        linear-gradient(135deg, #15152a 0%, #10131a 58%, #111820 100%);
+    border-color: #2b2948;
+}
+
+html.dark-mode .hero-glow {
+    background: rgba(91, 75, 255, 0.16);
+}
+
+html.dark-mode .secondary-btn {
+    color: var(--text);
+    background: var(--panel);
+    border-color: var(--border);
+}
+
+html.dark-mode .secondary-btn:hover {
+    background: var(--bg-soft);
+}
+
+html.dark-mode .search-box {
+    background: var(--panel);
+    border-color: var(--border);
+}
+
+html.dark-mode .search-box input {
+    color: var(--text);
+}
+
+html.dark-mode .search-box input::placeholder {
+    color: #737b89;
+}
+
+html.dark-mode .search-btn {
+    background: #f4f5f7;
+    color: #111827;
+}
+
+html.dark-mode .section-soft {
+    background: linear-gradient(180deg, var(--bg), #10131a);
+}
+
+html.dark-mode .poster-wrap {
+    background: #1b2029;
+}
+
+html.dark-mode .skeleton {
+    background: linear-gradient(
+        100deg,
+        #1a1f28 20%,
+        #252b36 40%,
+        #1a1f28 60%
+    );
+    background-size: 200% 100%;
+}
+
+html.dark-mode .modal-panel {
+    background: var(--panel);
+}
+
+html.dark-mode .modal-close {
+    background: rgba(21, 25, 34, 0.94);
+    color: #f4f5f7;
+}
+
+html.dark-mode .modal-cover-gradient {
+    background: linear-gradient(
+        to bottom,
+        rgba(21, 25, 34, 0) 20%,
+        rgba(21, 25, 34, .97) 100%
+    );
+}
+
+html.dark-mode .movie-meta {
+    color: #a5abb7;
+}
+
+html.dark-mode .tagline {
+    color: #b5bbc6;
+}
+
+html.dark-mode .overview {
+    color: #a5abb7;
+}
+
+html.dark-mode .people-info small {
+    color: #858c99;
+}
+
+html.dark-mode .people-info strong {
+    color: #e2e5ea;
+}
+
+html.dark-mode .modal-panel > .recommendations-section,
+html.dark-mode .modal-panel > #recommendations {
+    border-top-color: var(--border);
+    background: linear-gradient(
+        180deg,
+        #151922 0%,
+        #11141b 100%
+    );
+}
+
+html.dark-mode .footer {
+    background: #0f1218;
+    border-top-color: var(--border);
+}
+
+html.dark-mode .footer strong {
+    color: var(--text);
+}
+
+html.dark-mode .loading {
+    background: rgba(11, 13, 18, .78);
+}
+
+html.dark-mode .loading-card {
+    background: var(--panel);
+    border-color: var(--border);
+}
+
+html.dark-mode .spinner {
+    border-color: #302d55;
+    border-top-color: var(--accent);
+}
+
+/* Dark mode toggle button support */
+.dark-mode-toggle {
+    width: 40px;
+    height: 40px;
+    display: inline-grid;
+    place-items: center;
+    flex: 0 0 auto;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--panel);
+    color: var(--text);
+    font-size: 18px;
+    transition: background .2s ease, color .2s ease, transform .2s ease;
+}
+
+.dark-mode-toggle:hover {
+    background: var(--bg-soft);
+    transform: translateY(-1px);
+}
+
+html.dark-mode .dark-mode-toggle {
+    background: #1a1e27;
+    color: #f4f5f7;
+}
+
+/* Responsive recommendation area */
 
 @media (max-width: 1100px) {
     .modal-panel > .recommendations-section .recommendation-grid,
@@ -1081,5 +1285,132 @@ img {
     .modal-panel > #recommendations #recommendationGrid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 15px;
+    }
+}
+/* =========================================================
+   DARK MODE TOGGLE BUTTON
+   ONLY STYLING — NO OTHER DESIGN CHANGES
+   ========================================================= */
+
+#themeToggle,
+#darkModeToggle,
+[data-theme-toggle] {
+    width: 44px;
+    height: 44px;
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+
+    padding: 0;
+    margin: 0;
+
+    border: 1px solid var(--border);
+    border-radius: 12px;
+
+    background: var(--panel);
+    color: var(--text);
+
+    font-size: 19px;
+    line-height: 1;
+
+    cursor: pointer;
+
+    box-shadow: 0 6px 18px rgba(30, 35, 60, 0.08);
+
+    transition:
+        background 0.2s ease,
+        color 0.2s ease,
+        border-color 0.2s ease,
+        box-shadow 0.2s ease,
+        transform 0.2s ease;
+}
+
+
+/* Hover */
+
+#themeToggle:hover,
+#darkModeToggle:hover,
+[data-theme-toggle]:hover {
+    background: var(--bg-soft);
+    color: var(--accent);
+
+    border-color: rgba(119, 102, 255, 0.35);
+
+    box-shadow:
+        0 8px 22px rgba(80, 70, 180, 0.14);
+
+    transform: translateY(-1px);
+}
+
+
+/* Click */
+
+#themeToggle:active,
+#darkModeToggle:active,
+[data-theme-toggle]:active {
+    transform: translateY(0) scale(0.96);
+}
+
+
+/* Keyboard focus */
+
+#themeToggle:focus-visible,
+#darkModeToggle:focus-visible,
+[data-theme-toggle]:focus-visible {
+    outline: none;
+
+    border-color: var(--accent);
+
+    box-shadow:
+        0 0 0 3px rgba(119, 102, 255, 0.18);
+}
+
+
+/* =========================================================
+   DARK MODE BUTTON — DARK THEME
+   ========================================================= */
+
+html.dark-mode #themeToggle,
+html.dark-mode #darkModeToggle,
+html.dark-mode [data-theme-toggle] {
+    background: #171a23;
+    color: #f8fafc;
+
+    border-color: #303542;
+
+    box-shadow:
+        0 6px 20px rgba(0, 0, 0, 0.30);
+}
+
+
+html.dark-mode #themeToggle:hover,
+html.dark-mode #darkModeToggle:hover,
+html.dark-mode [data-theme-toggle]:hover {
+    background: #20242f;
+    color: #a99cff;
+
+    border-color: rgba(119, 102, 255, 0.55);
+
+    box-shadow:
+        0 8px 24px rgba(0, 0, 0, 0.40);
+}
+
+
+/* =========================================================
+   MOBILE
+   ========================================================= */
+
+@media (max-width: 700px) {
+
+    #themeToggle,
+    #darkModeToggle,
+    [data-theme-toggle] {
+        width: 40px;
+        height: 40px;
+
+        border-radius: 11px;
+
+        font-size: 17px;
     }
 }
