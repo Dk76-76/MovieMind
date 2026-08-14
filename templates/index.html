@@ -9,7 +9,7 @@
         content="MovieMind — Discover movies and get AI-powered recommendations."
     >
 
-    <meta name="theme-color" content="#ffffff">
+    <meta name="theme-color" content="#ffffff" id="themeColor">
 
     <title>MovieMind — AI Movie Discovery</title>
 
@@ -82,6 +82,19 @@
                 Animation
             </button>
         </nav>
+
+
+        <!-- DARK MODE TOGGLE -->
+
+        <button
+            class="theme-toggle"
+            id="themeToggle"
+            type="button"
+            aria-label="Switch to dark mode"
+            title="Switch to dark mode"
+        >
+            <span class="theme-icon" id="themeIcon">☾</span>
+        </button>
 
 
         <button
@@ -612,12 +625,7 @@
                 </div>
 
 
-                <!-- =================================================
-                     MOVIE ACTIONS
-
-                     IMPORTANT:
-                     NO RECOMMEND BUTTON
-                ================================================== -->
+                <!-- MOVIE ACTIONS -->
 
                 <div class="modal-actions">
 
@@ -640,9 +648,8 @@
         <!-- =================================================
              AI RECOMMENDATIONS
 
-             IMPORTANT:
-             JS will move/use this section inside modal.
-             It starts hidden so NEW USER does not see it.
+             Hidden for a new user.
+             JS displays recommendations after movie selection.
         ================================================== -->
 
         <section
@@ -664,7 +671,6 @@
                             this movie
                         </span>
                     </h2>
-
 
                 </div>
 
