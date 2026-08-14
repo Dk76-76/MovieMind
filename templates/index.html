@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <meta
+        name="description"
+        content="MovieMind — Discover movies and get AI-powered recommendations."
+    >
+
+    <meta name="theme-color" content="#ffffff">
+
+    <title>MovieMind — AI Movie Discovery</title>
+
+    <link
+        rel="stylesheet"
+        href="/static/style.css"
+    >
+</head>
+
+<body>
+
+<!-- =========================================================
+     NAVBAR
+========================================================= -->
+
+<header class="navbar">
+    <div class="container nav-inner">
+
+        <button
+            class="brand"
+            id="homeBtn"
+            type="button"
+            aria-label="Go to MovieMind home"
+        >
+            <span class="brand-icon">M</span>
+
+            <span class="brand-text">
+                <strong>MovieMind</strong>
+                <small>AI Movie Discovery</small>
+            </span>
+        </button>
+
+
+        <nav
+            class="nav-links"
+            aria-label="Main navigation"
+        >
+            <button
+                type="button"
+                data-scroll="home"
+            >
+                Home
+            </button>
+
+            <button
+                type="button"
+                data-scroll="trending"
+            >
+                Trending
+            </button>
+
+            <button
+                type="button"
+                data-scroll="popular"
+            >
+                Popular
+            </button>
+
+            <button
+                type="button"
+                data-scroll="topRated"
+            >
+                Top Rated
+            </button>
+
+            <button
+                type="button"
+                data-scroll="animation"
+            >
+                Animation
+            </button>
+        </nav>
+
+
+        <button
+            class="mobile-menu"
+            id="mobileMenu"
+            type="button"
+            aria-label="Open navigation menu"
+        >
+            ☰
+        </button>
+
+    </div>
+</header>
+
+
+<!-- =========================================================
+     MAIN
+========================================================= -->
+
+<main id="home">
+
+
+    <!-- =====================================================
+         HERO
+    ====================================================== -->
+
+    <section class="hero">
+
+        <div class="hero-glow"></div>
+
+        <div class="container hero-inner">
+
+            <div class="hero-copy">
+
+                <span class="eyebrow">
+                    ✦ SMART MOVIE DISCOVERY
+                </span>
+
+                <h1>
+                    Find a movie
+                    <br>
+                    <span>you'll love.</span>
+                </h1>
+
+                <p>
+                    Discover trending, popular and top-rated movies
+                    powered by TMDB. Then let MovieMind's AI model
+                    find movies similar to what you love.
+                </p>
+
+                <div class="hero-actions">
+
+                    <button
+                        class="primary-btn"
+                        id="exploreBtn"
+                        type="button"
+                    >
+                        Explore Movies
+                        <span>→</span>
+                    </button>
+
+                    <button
+                        class="secondary-btn"
+                        type="button"
+                        data-scroll="trending"
+                    >
+                        See Trending
+                    </button>
+
+                </div>
+
+            </div>
+
+
+            <div
+                class="hero-art"
+                aria-hidden="true"
+            >
+
+                <div class="art-card art-back"></div>
+
+                <div class="art-card art-middle"></div>
+
+                <div class="art-card art-front">
+
+                    <div class="art-label">
+                        MOVIE
+                    </div>
+
+                    <div class="art-circle">
+                        ▶
+                    </div>
+
+                    <div class="art-lines"></div>
+
+                </div>
+
+            </div>
+
+        </div>
+
+    </section>
+
+
+    <!-- =====================================================
+         SEARCH
+    ====================================================== -->
+
+    <section class="search-section">
+
+        <div class="container">
+
+            <div class="search-box">
+
+                <div
+                    class="search-icon"
+                    aria-hidden="true"
+                >
+                    ⌕
+                </div>
+
+                <input
+                    id="searchInput"
+                    type="search"
+                    placeholder="Search movies..."
+                    autocomplete="off"
+                    aria-label="Search movies"
+                >
+
+                <button
+                    id="clearSearch"
+                    class="clear-search"
+                    type="button"
+                    aria-label="Clear search"
+                >
+                    ×
+                </button>
+
+                <button
+                    id="searchBtn"
+                    class="search-btn"
+                    type="button"
+                >
+                    Search
+                </button>
+
+            </div>
+
+        </div>
+
+    </section>
+
+
+    <!-- =====================================================
+         SEARCH RESULTS
+    ====================================================== -->
+
+    <section
+        class="section hidden"
+        id="searchSection"
+    >
+
+        <div class="container">
+
+            <div class="section-heading">
+
+                <div>
+
+                    <span class="section-kicker">
+                        SEARCH
+                    </span>
+
+                    <h2 id="searchTitle">
+                        Search results
+                    </h2>
+
+                    <p>
+                        Movies matching your search.
+                    </p>
+
+                </div>
+
+            </div>
+
+
+            <div
+                class="movie-grid"
+                id="searchGrid"
+            ></div>
+
+        </div>
+
+    </section>
+
+
+    <!-- =====================================================
+         TRENDING
+         FIRST MOVIE SECTION
+    ====================================================== -->
+
+    <section
+        class="section"
+        id="trending"
+    >
+
+        <div class="container">
+
+            <div class="section-heading">
+
+                <div>
+
+                    <span class="section-kicker">
+                        🔥 NOW TRENDING
+                    </span>
+
+                    <h2>
+                        Trending Now
+                    </h2>
+
+                    <p>
+                        The movies everyone is talking about right now.
+                    </p>
+
+                </div>
+
+            </div>
+
+
+            <div
+                class="movie-grid"
+                id="trendingGrid"
+            ></div>
+
+        </div>
+
+    </section>
+
+
+    <!-- =====================================================
+         POPULAR
+    ====================================================== -->
+
+    <section
+        class="section section-soft"
+        id="popular"
+    >
+
+        <div class="container">
+
+            <div class="section-heading">
+
+                <div>
+
+                    <span class="section-kicker">
+                        ⭐ DISCOVER
+                    </span>
+
+                    <h2>
+                        Popular Movies
+                    </h2>
+
+                    <p>
+                        Crowd-favorite movies worth watching.
+                    </p>
+
+                </div>
+
+            </div>
+
+
+            <div
+                class="movie-grid"
+                id="homeGrid"
+            ></div>
+
+        </div>
+
+    </section>
+
+
+    <!-- =====================================================
+         TOP RATED
+    ====================================================== -->
+
+    <section
+        class="section"
+        id="topRated"
+    >
+
+        <div class="container">
+
+            <div class="section-heading">
+
+                <div>
+
+                    <span class="section-kicker">
+                        🏆 HIGHLY RATED
+                    </span>
+
+                    <h2>
+                        Top Rated
+                    </h2>
+
+                    <p>
+                        Highly rated movies selected from TMDB.
+                    </p>
+
+                </div>
+
+            </div>
+
+
+            <div
+                class="movie-grid"
+                id="topRatedGrid"
+            ></div>
+
+        </div>
+
+    </section>
+
+
+    <!-- =====================================================
+         ANIMATION
+    ====================================================== -->
+
+    <section
+        class="section section-soft"
+        id="animation"
+    >
+
+        <div class="container">
+
+            <div class="section-heading">
+
+                <div>
+
+                    <span class="section-kicker">
+                        🎨 ANIMATION
+                    </span>
+
+                    <h2>
+                        Animation
+                    </h2>
+
+                    <p>
+                        Animated movies for every kind of movie fan.
+                    </p>
+
+                </div>
+
+            </div>
+
+
+            <div
+                class="movie-grid"
+                id="animationGrid"
+            ></div>
+
+        </div>
+
+    </section>
+
+</main>
+
+
+<!-- =========================================================
+     MOVIE DETAILS MODAL
+========================================================= -->
+
+<div
+    class="modal hidden"
+    id="movieModal"
+    aria-hidden="true"
+>
+
+    <div
+        class="modal-backdrop"
+        id="modalBackdrop"
+    ></div>
+
+
+    <div
+        class="modal-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modalTitle"
+    >
+
+        <button
+            class="modal-close"
+            id="modalClose"
+            type="button"
+            aria-label="Close movie details"
+        >
+            ×
+        </button>
+
+
+        <!-- =================================================
+             MOVIE BACKDROP
+        ================================================== -->
+
+        <div class="modal-cover">
+
+            <div
+                class="modal-cover-bg"
+                id="modalCoverBg"
+            ></div>
+
+            <div class="modal-cover-gradient"></div>
+
+        </div>
+
+
+        <!-- =================================================
+             MOVIE INFORMATION
+        ================================================== -->
+
+        <div class="modal-content">
+
+
+            <!-- POSTER -->
+
+            <div class="modal-poster-wrap">
+
+                <img
+                    id="modalPoster"
+                    class="modal-poster"
+                    src=""
+                    alt=""
+                >
+
+            </div>
+
+
+            <!-- DETAILS -->
+
+            <div class="modal-info">
+
+                <span class="section-kicker">
+                    MOVIE DETAILS
+                </span>
+
+
+                <h2 id="modalTitle">
+                    Movie
+                </h2>
+
+
+                <!-- META -->
+
+                <div class="movie-meta">
+
+                    <span class="rating">
+                        ★
+                        <b id="modalRating">
+                            0.0
+                        </b>
+                    </span>
+
+                    <span id="modalYear">
+                        N/A
+                    </span>
+
+                    <span id="modalRuntime">
+                        —
+                    </span>
+
+                </div>
+
+
+                <!-- GENRES -->
+
+                <div
+                    class="chips"
+                    id="modalGenres"
+                ></div>
+
+
+                <!-- TAGLINE -->
+
+                <p
+                    class="tagline"
+                    id="modalTagline"
+                ></p>
+
+
+                <!-- OVERVIEW -->
+
+                <p
+                    class="overview"
+                    id="modalOverview"
+                >
+                    Loading movie information...
+                </p>
+
+
+                <!-- DIRECTOR / CAST -->
+
+                <div class="people-info">
+
+                    <div>
+
+                        <small>
+                            Director
+                        </small>
+
+                        <strong id="modalDirector">
+                            —
+                        </strong>
+
+                    </div>
+
+
+                    <div>
+
+                        <small>
+                            Cast
+                        </small>
+
+                        <strong id="modalCast">
+                            —
+                        </strong>
+
+                    </div>
+
+                </div>
+
+
+                <!-- =================================================
+                     MOVIE ACTIONS
+
+                     IMPORTANT:
+                     NO RECOMMEND BUTTON
+                ================================================== -->
+
+                <div class="modal-actions">
+
+                    <button
+                        class="secondary-btn"
+                        id="trailerBtn"
+                        type="button"
+                        hidden
+                    >
+                        ▶ Watch Trailer
+                    </button>
+
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <!-- =================================================
+             AI RECOMMENDATIONS
+
+             IMPORTANT:
+             JS will move/use this section inside modal.
+             It starts hidden so NEW USER does not see it.
+        ================================================== -->
+
+        <section
+            class="section recommendations-section hidden"
+            id="recommendations"
+        >
+
+            <div class="recommend-head">
+
+                <div>
+
+                    <span class="section-kicker">
+                        ✦ AI RECOMMENDATIONS
+                    </span>
+
+                    <h2>
+                        Because you liked
+                        <span id="basedOn">
+                            this movie
+                        </span>
+                    </h2>
+
+
+                </div>
+
+            </div>
+
+
+            <div
+                class="movie-grid"
+                id="recommendationGrid"
+            ></div>
+
+        </section>
+
+    </div>
+
+</div>
+
+
+<!-- =========================================================
+     LOADING OVERLAY
+========================================================= -->
+
+<div
+    class="loading hidden"
+    id="loading"
+>
+
+    <div class="loading-card">
+
+        <div class="spinner"></div>
+
+        <strong>
+            Loading movies...
+        </strong>
+
+        <span>
+            Fetching fresh TMDB data
+        </span>
+
+    </div>
+
+</div>
+
+
+<!-- =========================================================
+     TOAST
+========================================================= -->
+
+<div
+    class="toast"
+    id="toast"
+    role="status"
+    aria-live="polite"
+></div>
+
+
+<!-- =========================================================
+     FOOTER
+========================================================= -->
+
+<footer class="footer">
+
+    <div class="container">
+
+        <strong>
+            MovieMind
+        </strong>
+
+        <span>
+            TMDB-powered movie discovery
+            + AI recommendations.
+        </span>
+
+    </div>
+
+</footer>
+
+
+<!-- =========================================================
+     JAVASCRIPT
+========================================================= -->
+
+<script
+    src="/static/script.js"
+    defer
+></script>
+
+</body>
+</html>

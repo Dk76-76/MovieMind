@@ -1,0 +1,3404 @@
+
+main.py>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+from __future__ import annotations
+
+import asyncio
+import os
+import pickle
+import re
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pandas as pd
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from sklearn.metrics.pairwise import linear_kernel
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+TMDB_BASE_URL = "https://api.themoviedb.org/3"
+TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p"
+
+HOME_LIMIT = 18
+TRENDING_LIMIT = 18
+SEARCH_LIMIT = 12
+RECOMMEND_LIMIT = 11
+
+CACHE_TTL_HOME = 300
+CACHE_TTL_TRENDING = 300
+CACHE_TTL_SEARCH = 300
+CACHE_TTL_DETAILS = 1800
+CACHE_TTL_RECOMMEND = 1800
+
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+# ============================================================
+# MODEL LOADING
+# ============================================================
+
+def load_pickle(filename: str) -> Any:
+    path = BASE_DIR / filename
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{filename} not found. Put {filename} beside main.py."
+        )
+    with path.open("rb") as f:
+        return pickle.load(f)
+
+MODEL_ERROR = None
+df = pd.DataFrame()
+indices = None
+tfidf_matrix = None
+tfidf = None
+
+try:
+    df = load_pickle("df.pkl")
+    indices = load_pickle("indices.pkl")
+    tfidf_matrix = load_pickle("tfidf_matrix.pkl")
+    tfidf = load_pickle("tfidf.pkl")
+except Exception as exc:
+    MODEL_ERROR = str(exc)
+
+# ============================================================
+# CACHE
+# ============================================================
+
+_cache: dict[str, tuple[float, Any]] = {}
+
+def cache_get(key: str):
+    item = _cache.get(key)
+    if item is None:
+        return None
+    expires_at, value = item
+    if time.monotonic() >= expires_at:
+        _cache.pop(key, None)
+        return None
+    return value
+
+def cache_set(key: str, value: Any, ttl: int):
+    _cache[key] = (time.monotonic() + ttl, value)
+
+# ============================================================
+# HTTP CLIENT
+# ============================================================
+
+client: httpx.AsyncClient | None = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global client
+    client = httpx.AsyncClient(
+        base_url=TMDB_BASE_URL,
+        timeout=httpx.Timeout(8.0, connect=3.0),
+        limits=httpx.Limits(
+            max_connections=30,
+            max_keepalive_connections=15,
+        ),
+        headers={"accept": "application/json"},
+    )
+    yield
+    await client.aclose()
+    client = None
+
+app = FastAPI(
+    title="MovieMind",
+    description="TMDB movie discovery with a local TF-IDF recommendation model.",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount(
+    "/static",
+    StaticFiles(directory=str(BASE_DIR / "static")),
+    name="static",
+)
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def require_tmdb():
+    if not TMDB_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="TMDB_API_KEY is missing in .env",
+        )
+
+async def tmdb_get(endpoint: str, params: dict[str, Any] | None = None):
+    require_tmdb()
+
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="TMDB client is not ready.",
+        )
+
+    query = dict(params or {})
+    query["api_key"] = TMDB_API_KEY
+
+    try:
+        response = await client.get(endpoint, params=query)
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not connect to TMDB.",
+        ) from exc
+
+    if response.status_code == 401:
+        raise HTTPException(
+            status_code=500,
+            detail="TMDB API key is invalid.",
+        )
+
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=404,
+            detail="Movie not found.",
+        )
+
+    if response.status_code == 429:
+        raise HTTPException(
+            status_code=503,
+            detail="TMDB rate limit reached. Try again shortly.",
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"TMDB returned HTTP {response.status_code}.",
+        )
+
+    return response.json()
+
+def image_url(path: str | None, size: str = "w500"):
+    if not path:
+        return None
+    return f"{TMDB_IMAGE_BASE}/{size}{path}"
+
+def release_year(date_value: str | None):
+    if date_value and len(date_value) >= 4:
+        return date_value[:4]
+    return "N/A"
+
+def safe_rating(value: Any):
+    try:
+        return round(float(value), 1)
+    except (TypeError, ValueError):
+        return 0.0
+
+def genre_names(movie: dict[str, Any]):
+    genres = movie.get("genres") or []
+    if genres and isinstance(genres[0], dict):
+        return [g.get("name") for g in genres if g.get("name")]
+    return movie.get("genre_names") or []
+
+def clean_movie(movie: dict[str, Any]):
+    release_date = movie.get("release_date") or ""
+
+    return {
+        "tmdb_id": movie.get("id"),
+        "title": movie.get("title") or movie.get("original_title") or "Unknown Movie",
+        "overview": movie.get("overview") or "No overview available.",
+        "tagline": movie.get("tagline") or "",
+        "poster": image_url(movie.get("poster_path"), "w500"),
+        "poster_large": image_url(movie.get("poster_path"), "w780"),
+        "backdrop": image_url(movie.get("backdrop_path"), "w1280"),
+        "rating": safe_rating(movie.get("vote_average")),
+        "release_date": release_date,
+        "year": release_year(release_date),
+        "genres": genre_names(movie),
+        "popularity": movie.get("popularity"),
+        "runtime": movie.get("runtime"),
+        "language": movie.get("original_language"),
+    }
+
+def normalize_title(value: str):
+    value = str(value or "").lower().strip()
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+def find_model_index(title: str):
+    if df.empty or indices is None:
+        return None
+
+    wanted = normalize_title(title)
+
+    # Normal expected structure: pandas Series(title -> dataframe index)
+    if isinstance(indices, pd.Series):
+        exact = []
+        for raw_title, raw_index in indices.items():
+            if normalize_title(raw_title) == wanted:
+                try:
+                    exact.append(int(raw_index))
+                except (TypeError, ValueError):
+                    pass
+        if exact:
+            return exact[0]
+
+        # Fuzzy-ish fallback using starts/contains.
+        for raw_title, raw_index in indices.items():
+            normalized = normalize_title(raw_title)
+            if wanted and (wanted in normalized or normalized in wanted):
+                try:
+                    return int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+
+    # If indices is dict-like.
+    if isinstance(indices, dict):
+        for raw_title, raw_index in indices.items():
+            if normalize_title(raw_title) == wanted:
+                try:
+                    return int(raw_index)
+                except (TypeError, ValueError):
+                    return None
+
+    # Last fallback: search df title column.
+    if "title" in df.columns:
+        matches = df.index[
+            df["title"].astype(str).map(normalize_title) == wanted
+        ].tolist()
+        if matches:
+            return int(matches[0])
+
+    return None
+
+async def tmdb_search_one(title: str):
+    data = await tmdb_get(
+        "/search/movie",
+        {
+            "query": title,
+            "language": "en-US",
+            "include_adult": "false",
+            "page": 1,
+        },
+    )
+    results = data.get("results") or []
+    if not results:
+        return None
+
+    wanted = normalize_title(title)
+
+    for movie in results:
+        if normalize_title(movie.get("title", "")) == wanted:
+            return movie
+
+    return results[0]
+
+# ============================================================
+# PAGES
+# ============================================================
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    return templates.TemplateResponse(
+        "index.html",
+        {"request": request},
+    )
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "tmdb_configured": bool(TMDB_API_KEY),
+        "model_loaded": MODEL_ERROR is None,
+        "model_error": MODEL_ERROR,
+        "movies_in_model": int(len(df)) if not df.empty else 0,
+    }
+
+# ============================================================
+# HOME / TRENDING / SEARCH
+# ============================================================
+
+@app.get("/api/home")
+async def home():
+    key = "home"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    async def get_page(page: int):
+        return await tmdb_get(
+            "/discover/movie",
+            {
+                "language": "en-US",
+                "include_adult": "false",
+                "include_video": "false",
+                "sort_by": "popularity.desc",
+                "vote_count.gte": 100,
+                "page": page,
+            },
+        )
+
+    page1, page2 = await asyncio.gather(
+        get_page(1),
+        get_page(2),
+    )
+
+    movies = []
+    seen = set()
+
+    for movie in (page1.get("results") or []) + (page2.get("results") or []):
+        movie_id = movie.get("id")
+        if not movie_id or movie_id in seen:
+            continue
+        if not movie.get("poster_path"):
+            continue
+
+        seen.add(movie_id)
+        movies.append(clean_movie(movie))
+
+        if len(movies) >= HOME_LIMIT:
+            break
+
+    payload = {"movies": movies, "count": len(movies)}
+    cache_set(key, payload, CACHE_TTL_HOME)
+    return payload
+
+@app.get("/api/trending")
+async def trending():
+    key = "trending"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    data = await tmdb_get(
+        "/trending/movie/week",
+        {"language": "en-US"},
+    )
+
+    movies = [
+        clean_movie(movie)
+        for movie in (data.get("results") or [])
+        if movie.get("poster_path")
+    ][:TRENDING_LIMIT]
+
+    payload = {"movies": movies, "count": len(movies)}
+    cache_set(key, payload, CACHE_TTL_TRENDING)
+    return payload
+
+@app.get("/api/search")
+async def search(
+    q: str = Query(..., min_length=1, max_length=100)
+):
+    query = q.strip()
+    key = f"search:{query.casefold()}"
+
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    data = await tmdb_get(
+        "/search/movie",
+        {
+            "query": query,
+            "language": "en-US",
+            "include_adult": "false",
+            "page": 1,
+        },
+    )
+
+    movies = [
+        clean_movie(movie)
+        for movie in (data.get("results") or [])
+        if movie.get("poster_path")
+    ][:SEARCH_LIMIT]
+
+    payload = {
+        "query": query,
+        "movies": movies,
+        "count": len(movies),
+    }
+
+    cache_set(key, payload, CACHE_TTL_SEARCH)
+    return payload
+
+# ============================================================
+# MOVIE DETAILS
+# ============================================================
+
+@app.get("/api/movie/{tmdb_id}")
+async def movie_details(tmdb_id: int):
+    key = f"details:{tmdb_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    details_task = tmdb_get(
+        f"/movie/{tmdb_id}",
+        {"language": "en-US"},
+    )
+    credits_task = tmdb_get(
+        f"/movie/{tmdb_id}/credits",
+        {"language": "en-US"},
+    )
+    videos_task = tmdb_get(
+        f"/movie/{tmdb_id}/videos",
+        {"language": "en-US"},
+    )
+
+    details, credits, videos = await asyncio.gather(
+        details_task,
+        credits_task,
+        videos_task,
+    )
+
+    movie = clean_movie(details)
+
+    cast = []
+    for person in (credits.get("cast") or [])[:8]:
+        cast.append({
+            "name": person.get("name"),
+            "character": person.get("character"),
+            "profile": image_url(person.get("profile_path"), "w185"),
+        })
+
+    director = None
+    for person in credits.get("crew") or []:
+        if person.get("job") == "Director":
+            director = person.get("name")
+            break
+
+    trailer_key = None
+    for video in videos.get("results") or []:
+        if (
+            video.get("site") == "YouTube"
+            and video.get("type") in {"Trailer", "Teaser"}
+        ):
+            trailer_key = video.get("key")
+            if video.get("type") == "Trailer":
+                break
+
+    movie.update({
+        "cast": cast,
+        "director": director,
+        "trailer_key": trailer_key,
+        "homepage": details.get("homepage"),
+        "budget": details.get("budget"),
+        "revenue": details.get("revenue"),
+    })
+
+    cache_set(key, movie, CACHE_TTL_DETAILS)
+    return movie
+
+# ============================================================
+# TF-IDF RECOMMENDATIONS
+# ============================================================
+
+@app.get("/api/recommendations")
+async def recommendations(
+    title: str = Query(..., min_length=1, max_length=200)
+):
+    if MODEL_ERROR is not None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Recommendation model could not be loaded: {MODEL_ERROR}",
+        )
+
+    if df.empty or tfidf_matrix is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Recommendation model is empty.",
+        )
+
+    key = f"recommend:{normalize_title(title)}"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    movie_index = find_model_index(title)
+
+    if movie_index is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f'"{title}" was not found in the recommendation model.',
+        )
+
+    try:
+        scores = linear_kernel(
+            tfidf_matrix[movie_index:movie_index + 1],
+            tfidf_matrix,
+        ).flatten()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not calculate recommendations: {exc}",
+        ) from exc
+
+    ranked_indices = scores.argsort()[::-1]
+
+    local_titles = []
+    selected_normalized = normalize_title(title)
+
+    for idx in ranked_indices:
+        if int(idx) == int(movie_index):
+            continue
+
+        if idx >= len(df):
+            continue
+
+        raw_title = str(df.iloc[int(idx)].get("title", "")).strip()
+        if not raw_title:
+            continue
+
+        if normalize_title(raw_title) == selected_normalized:
+            continue
+
+        if raw_title not in local_titles:
+            local_titles.append(raw_title)
+
+        if len(local_titles) >= RECOMMEND_LIMIT:
+            break
+
+    # Resolve all recommendation posters/rating/info from TMDB concurrently.
+    tmdb_results = await asyncio.gather(
+        *(tmdb_search_one(movie_title) for movie_title in local_titles),
+        return_exceptions=True,
+    )
+
+    movies = []
+    seen_ids = set()
+
+    for result in tmdb_results:
+        if isinstance(result, Exception) or result is None:
+            continue
+
+        movie_id = result.get("id")
+        if not movie_id or movie_id in seen_ids:
+            continue
+
+        if not result.get("poster_path"):
+            continue
+
+        seen_ids.add(movie_id)
+        movies.append(clean_movie(result))
+
+        if len(movies) >= RECOMMEND_LIMIT:
+            break
+
+    payload = {
+        "based_on": title,
+        "movies": movies,
+        "count": len(movies),
+    }
+
+    cache_set(key, payload, CACHE_TTL_RECOMMEND)
+    return payload
+
+
+index.html>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#ffffff">
+    <title>MovieMind — Discover Your Next Movie</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+
+<header class="navbar">
+    <div class="container nav-inner">
+
+        <button class="brand" id="homeBtn" type="button">
+            <span class="brand-icon">M</span>
+            <span>
+                <strong>MovieMind</strong>
+                <small>AI Movie Discovery</small>
+            </span>
+        </button>
+
+        <nav class="nav-links">
+            <button type="button" data-scroll="home">Home</button>
+            <button type="button" data-scroll="trending">Trending</button>
+            <button type="button" data-scroll="popular">Popular</button>
+            <button type="button" data-scroll="recommendations">Recommendations</button>
+        </nav>
+
+        <button class="mobile-menu" id="mobileMenu" type="button">☰</button>
+    </div>
+</header>
+
+<main>
+
+    <!-- HERO -->
+    <section class="hero" id="home">
+        <div class="hero-glow"></div>
+
+        <div class="container hero-inner">
+
+            <div class="hero-copy">
+                <span class="eyebrow">✦ Smart movie discovery</span>
+
+                <h1>Find a movie<br><span>you'll love.</span></h1>
+
+                <p>
+                    Explore popular and trending movies powered by TMDB,
+                    then get personalized recommendations from your AI
+                    similarity model.
+                </p>
+
+                <div class="hero-actions">
+                    <button class="primary-btn" id="exploreBtn">
+                        Explore Movies <span>→</span>
+                    </button>
+
+                    <button class="secondary-btn" data-scroll="trending">
+                        See Trending
+                    </button>
+                </div>
+            </div>
+
+            <div class="hero-art">
+                <div class="art-card art-back"></div>
+                <div class="art-card art-middle"></div>
+                <div class="art-card art-front">
+                    <div class="art-label">MOVIE</div>
+                    <div class="art-circle">▶</div>
+                    <div class="art-lines"></div>
+                </div>
+            </div>
+
+        </div>
+    </section>
+
+    <!-- SEARCH -->
+    <section class="search-section">
+        <div class="container">
+            <div class="search-box">
+
+                <div class="search-icon">⌕</div>
+
+                <input
+                    id="searchInput"
+                    type="search"
+                    placeholder="Search movies..."
+                    autocomplete="off"
+                    aria-label="Search movies"
+                >
+
+                <button id="clearSearch" class="clear-search" type="button">
+                    ×
+                </button>
+
+                <button id="searchBtn" class="search-btn" type="button">
+                    Search
+                </button>
+
+            </div>
+        </div>
+    </section>
+
+    <!-- SEARCH RESULTS -->
+    <section class="section hidden" id="searchSection">
+        <div class="container">
+
+            <div class="section-heading">
+                <div>
+                    <span class="section-kicker">SEARCH</span>
+                    <h2 id="searchTitle">Search results</h2>
+                    <p>Movies matching your search.</p>
+                </div>
+            </div>
+
+            <div class="movie-grid" id="searchGrid"></div>
+        </div>
+    </section>
+
+    <!-- POPULAR -->
+    <section class="section" id="popular">
+        <div class="container">
+
+            <div class="section-heading">
+                <div>
+                    <span class="section-kicker">DISCOVER</span>
+                    <h2>Popular Movies</h2>
+                    <p>Fresh picks with strong audience interest.</p>
+                </div>
+            </div>
+
+            <div class="movie-grid" id="homeGrid"></div>
+        </div>
+    </section>
+
+    <!-- TRENDING -->
+    <section class="section section-soft" id="trending">
+        <div class="container">
+
+            <div class="section-heading">
+                <div>
+                    <span class="section-kicker">🔥 NOW TRENDING</span>
+                    <h2>Trending Now</h2>
+                    <p>What movie fans are watching right now.</p>
+                </div>
+            </div>
+
+            <div class="movie-grid" id="trendingGrid"></div>
+        </div>
+    </section>
+
+    <!-- RECOMMENDATIONS -->
+    <section class="section recommendations-section hidden" id="recommendations">
+        <div class="container">
+
+            <div class="recommend-head">
+                <div>
+                    <span class="section-kicker">✦ AI RECOMMENDATIONS</span>
+                    <h2>Because you liked <span id="basedOn">this movie</span></h2>
+                    <p>11 recommendations selected by your movie similarity model.</p>
+                </div>
+            </div>
+
+            <div class="movie-grid" id="recommendationGrid"></div>
+        </div>
+    </section>
+
+</main>
+
+<!-- MOVIE MODAL -->
+<div class="modal hidden" id="movieModal" aria-hidden="true">
+
+    <div class="modal-backdrop" id="modalBackdrop"></div>
+
+    <div class="modal-panel">
+
+        <button class="modal-close" id="modalClose" type="button">
+            ×
+        </button>
+
+        <div class="modal-cover">
+            <div class="modal-cover-bg" id="modalCoverBg"></div>
+            <div class="modal-cover-gradient"></div>
+        </div>
+
+        <div class="modal-content">
+
+            <div class="modal-poster-wrap">
+                <img id="modalPoster" class="modal-poster" alt="">
+            </div>
+
+            <div class="modal-info">
+
+                <span class="section-kicker">MOVIE DETAILS</span>
+
+                <h2 id="modalTitle">Movie</h2>
+
+                <div class="movie-meta">
+                    <span class="rating">★ <b id="modalRating">0.0</b></span>
+                    <span id="modalYear">N/A</span>
+                    <span id="modalRuntime">—</span>
+                </div>
+
+                <div class="chips" id="modalGenres"></div>
+
+                <p class="tagline" id="modalTagline"></p>
+
+                <p class="overview" id="modalOverview">
+                    Loading movie information...
+                </p>
+
+                <div class="people-info">
+                    <div>
+                        <small>Director</small>
+                        <strong id="modalDirector">—</strong>
+                    </div>
+
+                    <div>
+                        <small>Cast</small>
+                        <strong id="modalCast">—</strong>
+                    </div>
+                </div>
+
+                <div class="modal-actions">
+
+                    <button class="primary-btn" id="recommendBtn" type="button">
+                        ✦ Get Recommendations
+                    </button>
+
+                    <button class="secondary-btn" id="trailerBtn" type="button" hidden>
+                        ▶ Watch Trailer
+                    </button>
+
+                </div>
+
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- LOADING -->
+<div class="loading hidden" id="loading">
+    <div class="loading-card">
+        <div class="spinner"></div>
+        <strong>Loading movies...</strong>
+        <span>Fetching fresh TMDB data</span>
+    </div>
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<footer class="footer">
+    <div class="container">
+        <strong>MovieMind</strong>
+        <span>TMDB-powered movie discovery + local AI recommendations.</span>
+    </div>
+</footer>
+
+<script src="/static/script.js"></script>
+</body>
+</html>
+
+style.css >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+:root {
+    --bg: #ffffff;
+    --bg-soft: #f6f8fc;
+    --panel: #ffffff;
+    --text: #111827;
+    --muted: #6b7280;
+    --border: #e7eaf0;
+    --accent: #5b4bff;
+    --accent-dark: #4638e8;
+    --accent-soft: #efedff;
+    --gold: #f59e0b;
+    --shadow: 0 16px 50px rgba(24, 32, 56, 0.10);
+    --shadow-card: 0 12px 30px rgba(24, 32, 56, 0.10);
+    --radius: 22px;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html {
+    scroll-behavior: smooth;
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.5;
+}
+
+button,
+input {
+    font: inherit;
+}
+
+button {
+    cursor: pointer;
+}
+
+img {
+    display: block;
+    max-width: 100%;
+}
+
+.hidden {
+    display: none !important;
+}
+
+.container {
+    width: min(1280px, calc(100% - 40px));
+    margin: 0 auto;
+}
+
+/* NAVBAR */
+
+.navbar {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(255, 255, 255, 0.90);
+    backdrop-filter: blur(18px);
+    border-bottom: 1px solid rgba(231, 234, 240, 0.9);
+}
+
+.nav-inner {
+    min-height: 76px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 28px;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border: 0;
+    background: transparent;
+    color: var(--text);
+    padding: 0;
+    text-align: left;
+}
+
+.brand-icon {
+    width: 42px;
+    height: 42px;
+    border-radius: 13px;
+    display: grid;
+    place-items: center;
+    color: #fff;
+    font-weight: 900;
+    font-size: 19px;
+    background: linear-gradient(135deg, #6b5cff, #8b7cff);
+    box-shadow: 0 10px 25px rgba(91, 75, 255, 0.28);
+}
+
+.brand strong {
+    display: block;
+    font-size: 17px;
+    line-height: 1.1;
+}
+
+.brand small {
+    display: block;
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.nav-links {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.nav-links button {
+    border: 0;
+    background: transparent;
+    color: #596174;
+    padding: 9px 13px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 650;
+}
+
+.nav-links button:hover {
+    background: var(--bg-soft);
+    color: var(--accent);
+}
+
+.mobile-menu {
+    display: none;
+    border: 0;
+    background: var(--bg-soft);
+    border-radius: 10px;
+    padding: 10px 12px;
+}
+
+/* HERO */
+
+.hero {
+    padding: 34px 0 44px;
+    overflow: hidden;
+}
+
+.hero-inner {
+    min-height: 460px;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 40px;
+    padding: 60px;
+    border-radius: 34px;
+    background:
+        radial-gradient(circle at 90% 20%, rgba(119, 102, 255, 0.22), transparent 30%),
+        radial-gradient(circle at 70% 90%, rgba(102, 210, 255, 0.14), transparent 28%),
+        linear-gradient(135deg, #f5f4ff 0%, #ffffff 58%, #f7fbff 100%);
+    border: 1px solid #e9e8ff;
+    box-shadow: var(--shadow);
+}
+
+.hero-glow {
+    position: absolute;
+    width: 350px;
+    height: 350px;
+    border-radius: 50%;
+    background: rgba(91, 75, 255, 0.12);
+    filter: blur(70px);
+    top: 10px;
+    right: 20%;
+    pointer-events: none;
+}
+
+.hero-copy {
+    position: relative;
+    z-index: 2;
+    max-width: 650px;
+}
+
+.eyebrow,
+.section-kicker {
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 850;
+    letter-spacing: 0.14em;
+}
+
+.eyebrow {
+    display: inline-flex;
+    padding: 8px 13px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+}
+
+.hero h1 {
+    margin: 18px 0 0;
+    font-size: clamp(46px, 6vw, 78px);
+    line-height: 0.98;
+    letter-spacing: -0.055em;
+}
+
+.hero h1 span {
+    color: var(--accent);
+}
+
+.hero p {
+    max-width: 590px;
+    margin: 22px 0 0;
+    color: var(--muted);
+    font-size: 17px;
+    line-height: 1.75;
+}
+
+.hero-actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 30px;
+}
+
+.primary-btn,
+.secondary-btn {
+    border-radius: 13px;
+    padding: 13px 18px;
+    font-weight: 750;
+    border: 1px solid transparent;
+    transition: transform .2s ease, box-shadow .2s ease, background .2s ease;
+}
+
+.primary-btn {
+    color: #fff;
+    background: linear-gradient(135deg, var(--accent), #7668ff);
+    box-shadow: 0 12px 28px rgba(91, 75, 255, 0.24);
+}
+
+.primary-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 16px 34px rgba(91, 75, 255, 0.30);
+}
+
+.secondary-btn {
+    color: var(--text);
+    background: #fff;
+    border-color: var(--border);
+}
+
+.secondary-btn:hover {
+    background: var(--bg-soft);
+    transform: translateY(-2px);
+}
+
+/* HERO ART */
+
+.hero-art {
+    width: 420px;
+    height: 340px;
+    position: relative;
+    flex: 0 0 auto;
+}
+
+.art-card {
+    position: absolute;
+    width: 190px;
+    height: 270px;
+    border-radius: 20px;
+    box-shadow: 0 25px 60px rgba(42, 44, 74, 0.20);
+    overflow: hidden;
+}
+
+.art-back {
+    right: 25px;
+    top: 35px;
+    transform: rotate(13deg);
+    background: linear-gradient(145deg, #c8c5ff, #8a7dff 45%, #e7eaff);
+}
+
+.art-middle {
+    left: 70px;
+    top: 28px;
+    transform: rotate(-10deg);
+    background: linear-gradient(145deg, #b8e6ff, #6b8cff 50%, #e6e4ff);
+}
+
+.art-front {
+    left: 120px;
+    top: 45px;
+    transform: rotate(1deg);
+    background: linear-gradient(155deg, #171a2f, #433b88 48%, #6b5cff);
+    color: #fff;
+    padding: 22px;
+}
+
+.art-label {
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: .22em;
+    opacity: .7;
+}
+
+.art-circle {
+    width: 82px;
+    height: 82px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    margin: 52px auto 34px;
+    border: 1px solid rgba(255,255,255,.4);
+    background: rgba(255,255,255,.12);
+    backdrop-filter: blur(8px);
+    font-size: 25px;
+}
+
+.art-lines {
+    height: 42px;
+    border-top: 2px solid rgba(255,255,255,.5);
+    border-bottom: 2px solid rgba(255,255,255,.18);
+}
+
+/* SEARCH */
+
+.search-section {
+    margin-top: -4px;
+    position: relative;
+    z-index: 5;
+}
+
+.search-box {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 9px;
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    box-shadow: var(--shadow);
+}
+
+.search-icon {
+    width: 46px;
+    height: 46px;
+    display: grid;
+    place-items: center;
+    color: var(--accent);
+    font-size: 27px;
+    background: var(--accent-soft);
+    border-radius: 13px;
+}
+
+.search-box input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    color: var(--text);
+    font-size: 16px;
+    background: transparent;
+    padding: 0 4px;
+}
+
+.search-box input::placeholder {
+    color: #9aa1af;
+}
+
+.search-btn {
+    border: 0;
+    border-radius: 12px;
+    padding: 13px 21px;
+    background: var(--text);
+    color: #fff;
+    font-weight: 750;
+}
+
+.clear-search {
+    display: none;
+    border: 0;
+    background: transparent;
+    color: #9aa1af;
+    font-size: 24px;
+}
+
+/* SECTIONS */
+
+.section {
+    padding: 72px 0 0;
+}
+
+.section-soft {
+    padding-bottom: 76px;
+    background: linear-gradient(180deg, #fff, #f8f9fc);
+}
+
+.section-heading,
+.recommend-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: end;
+    margin-bottom: 26px;
+}
+
+.section-heading h2,
+.recommend-head h2 {
+    margin: 6px 0 0;
+    font-size: clamp(28px, 4vw, 38px);
+    letter-spacing: -0.04em;
+}
+
+.section-heading p,
+.recommend-head p {
+    margin: 7px 0 0;
+    color: var(--muted);
+}
+
+.recommend-head h2 span {
+    color: var(--accent);
+}
+
+/* GRID */
+
+.movie-grid {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 20px;
+}
+
+.movie-card {
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+    transition: transform .22s ease;
+}
+
+.movie-card:hover {
+    transform: translateY(-7px);
+}
+
+.poster-wrap {
+    position: relative;
+    overflow: hidden;
+    aspect-ratio: 2 / 3;
+    border-radius: 17px;
+    background: #edf0f5;
+    box-shadow: var(--shadow-card);
+}
+
+.poster {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transition: transform .35s ease, filter .35s ease;
+}
+
+.movie-card:hover .poster {
+    transform: scale(1.055);
+    filter: brightness(.82);
+}
+
+.rating-badge {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    padding: 6px 9px;
+    border-radius: 8px;
+    color: #fff;
+    background: rgba(17, 24, 39, .82);
+    backdrop-filter: blur(8px);
+    font-size: 11px;
+    font-weight: 800;
+}
+
+.poster-overlay {
+    position: absolute;
+    inset: auto 0 0 0;
+    padding: 42px 13px 13px;
+    color: #fff;
+    background: linear-gradient(transparent, rgba(0,0,0,.86));
+    opacity: 0;
+    transition: opacity .25s ease;
+}
+
+.movie-card:hover .poster-overlay {
+    opacity: 1;
+}
+
+.view-label {
+    font-size: 12px;
+    font-weight: 800;
+}
+
+.card-info {
+    padding: 11px 3px 0;
+}
+
+.card-title {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.35;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.card-meta {
+    display: flex;
+    gap: 6px;
+    margin-top: 5px;
+    color: #8a92a3;
+    font-size: 11px;
+}
+
+/* SKELETON */
+
+.skeleton {
+    aspect-ratio: 2 / 3;
+    border-radius: 17px;
+    background: linear-gradient(
+        100deg,
+        #edf0f4 20%,
+        #f8f9fb 40%,
+        #edf0f4 60%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.2s infinite;
+}
+
+@keyframes shimmer {
+    to {
+        background-position: -200% 0;
+    }
+}
+
+/* MODAL */
+
+.modal {
+    position: fixed;
+    inset: 0;
+    z-index: 500;
+    display: grid;
+    place-items: center;
+    padding: 25px;
+}
+
+.modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(12, 16, 28, .72);
+    backdrop-filter: blur(10px);
+}
+
+.modal-panel {
+    position: relative;
+    z-index: 2;
+    width: min(1050px, 100%);
+    max-height: 92vh;
+    overflow: auto;
+    background: #fff;
+    border-radius: 28px;
+    box-shadow: 0 40px 100px rgba(0,0,0,.28);
+    animation: modalIn .22s ease;
+}
+
+@keyframes modalIn {
+    from {
+        opacity: 0;
+        transform: translateY(15px) scale(.98);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+.modal-close {
+    position: absolute;
+    z-index: 10;
+    top: 16px;
+    right: 16px;
+    width: 42px;
+    height: 42px;
+    border: 0;
+    border-radius: 50%;
+    background: rgba(255,255,255,.92);
+    color: #111827;
+    font-size: 25px;
+    box-shadow: 0 8px 25px rgba(0,0,0,.14);
+}
+
+.modal-cover {
+    height: 260px;
+    position: relative;
+    overflow: hidden;
+}
+
+.modal-cover-bg {
+    position: absolute;
+    inset: 0;
+    background-size: cover;
+    background-position: center;
+    filter: saturate(1.05);
+}
+
+.modal-cover-gradient {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+        to bottom,
+        rgba(255,255,255,0) 20%,
+        rgba(255,255,255,.96) 100%
+    );
+}
+
+.modal-content {
+    display: grid;
+    grid-template-columns: 250px 1fr;
+    gap: 34px;
+    padding: 0 42px 42px;
+    margin-top: -110px;
+    position: relative;
+}
+
+.modal-poster-wrap {
+    position: relative;
+    z-index: 2;
+}
+
+.modal-poster {
+    width: 250px;
+    aspect-ratio: 2 / 3;
+    object-fit: cover;
+    border-radius: 17px;
+    box-shadow: 0 25px 60px rgba(0,0,0,.20);
+    background: #eef0f4;
+}
+
+.modal-info {
+    padding-top: 105px;
+}
+
+.modal-info h2 {
+    margin: 5px 0 12px;
+    font-size: clamp(30px, 4vw, 48px);
+    line-height: 1.02;
+    letter-spacing: -.04em;
+}
+
+.movie-meta {
+    display: flex;
+    gap: 15px;
+    color: #697183;
+    font-size: 14px;
+    font-weight: 650;
+}
+
+.movie-meta .rating {
+    color: var(--gold);
+}
+
+.chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-top: 15px;
+}
+
+.chip {
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 800;
+}
+
+.tagline {
+    color: #525b6d;
+    font-style: italic;
+    margin: 18px 0 0;
+}
+
+.overview {
+    color: #697183;
+    line-height: 1.75;
+    margin-top: 12px;
+}
+
+.people-info {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px;
+    margin-top: 20px;
+}
+
+.people-info small {
+    display: block;
+    color: #9299a8;
+    font-size: 11px;
+    margin-bottom: 4px;
+}
+
+.people-info strong {
+    display: block;
+    color: #343b49;
+    font-size: 13px;
+}
+
+.modal-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 25px;
+}
+
+/* LOADING */
+
+.loading {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: grid;
+    place-items: center;
+    background: rgba(255,255,255,.74);
+    backdrop-filter: blur(8px);
+}
+
+.loading-card {
+    display: grid;
+    justify-items: center;
+    gap: 7px;
+    padding: 26px 30px;
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    box-shadow: var(--shadow);
+}
+
+.loading-card strong {
+    font-size: 14px;
+}
+
+.loading-card span {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.spinner {
+    width: 35px;
+    height: 35px;
+    border: 3px solid #e9e8ff;
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .75s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* TOAST */
+
+.toast {
+    position: fixed;
+    z-index: 1200;
+    left: 50%;
+    bottom: 25px;
+    transform: translate(-50%, 30px);
+    opacity: 0;
+    pointer-events: none;
+    padding: 12px 17px;
+    border-radius: 12px;
+    color: #fff;
+    background: #111827;
+    box-shadow: 0 15px 35px rgba(0,0,0,.20);
+    font-size: 13px;
+    font-weight: 650;
+    transition: all .25s ease;
+}
+
+.toast.show {
+    opacity: 1;
+    transform: translate(-50%, 0);
+}
+
+/* FOOTER */
+
+.footer {
+    margin-top: 80px;
+    padding: 28px 0;
+    border-top: 1px solid var(--border);
+    background: #fafbfc;
+}
+
+.footer .container {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    flex-wrap: wrap;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.footer strong {
+    color: var(--text);
+}
+
+/* RESPONSIVE */
+
+@media (max-width: 1100px) {
+    .movie-grid {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+    }
+
+    .hero-inner {
+        padding: 45px;
+    }
+
+    .hero-art {
+        transform: scale(.86);
+        margin-right: -35px;
+    }
+}
+
+@media (max-width: 850px) {
+    .nav-links {
+        display: none;
+    }
+
+    .mobile-menu {
+        display: block;
+    }
+
+    .hero-inner {
+        min-height: 560px;
+    }
+
+    .hero-art {
+        position: absolute;
+        right: -80px;
+        bottom: -40px;
+        opacity: .38;
+    }
+
+    .hero-copy {
+        max-width: 100%;
+    }
+
+    .movie-grid {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .modal-content {
+        grid-template-columns: 190px 1fr;
+        gap: 24px;
+        padding: 0 28px 30px;
+    }
+
+    .modal-poster {
+        width: 190px;
+    }
+}
+
+@media (max-width: 620px) {
+    .container {
+        width: min(100% - 24px, 1280px);
+    }
+
+    .nav-inner {
+        min-height: 68px;
+    }
+
+    .hero {
+        padding-top: 15px;
+    }
+
+    .hero-inner {
+        padding: 32px 24px;
+        min-height: 520px;
+        border-radius: 25px;
+    }
+
+    .hero h1 {
+        font-size: 49px;
+    }
+
+    .hero p {
+        font-size: 15px;
+    }
+
+    .hero-art {
+        right: -120px;
+        bottom: -60px;
+    }
+
+    .search-box {
+        padding: 7px;
+    }
+
+    .search-icon {
+        display: none;
+    }
+
+    .search-btn {
+        padding: 12px 13px;
+    }
+
+    .movie-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+    }
+
+    .section {
+        padding-top: 55px;
+    }
+
+    .modal {
+        padding: 10px;
+    }
+
+    .modal-panel {
+        max-height: 96vh;
+        border-radius: 20px;
+    }
+
+    .modal-cover {
+        height: 180px;
+    }
+
+    .modal-content {
+        display: block;
+        padding: 0 20px 25px;
+        margin-top: -70px;
+    }
+
+    .modal-poster {
+        width: 150px;
+    }
+
+    .modal-info {
+        padding-top: 22px;
+    }
+
+    .modal-info h2 {
+        font-size: 31px;
+    }
+
+    .people-info {
+        grid-template-columns: 1fr;
+    }
+
+    .hero-actions,
+    .modal-actions {
+        flex-direction: column;
+        align-items: stretch;
+    }
+}
+
+script.js >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+"use strict";
+
+/* =========================================================
+   MOVIEMIND
+   FINAL FRONTEND SCRIPT
+   ========================================================= */
+
+const API = "/api";
+
+const state = {
+    currentMovie: null,
+    movieController: null,
+    recommendationController: null,
+    searchController: null,
+    requestCache: new Map(),
+    recommendationRequestId: 0,
+    toastTimer: null
+};
+
+
+/* =========================================================
+   DOM HELPER
+   ========================================================= */
+
+function $(selector) {
+    return document.querySelector(selector);
+}
+
+
+/* =========================================================
+   HTML SAFETY
+   ========================================================= */
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+
+/* =========================================================
+   ERROR HANDLING
+   ========================================================= */
+
+function friendlyError(error) {
+    if (!error) {
+        return "Something went wrong.";
+    }
+
+    if (error.name === "AbortError") {
+        return "Request cancelled.";
+    }
+
+    return error.message || "Something went wrong.";
+}
+
+
+/* =========================================================
+   TOAST
+   ========================================================= */
+
+function showToast(message) {
+    const toast = $("#toast");
+
+    if (!toast) {
+        return;
+    }
+
+    toast.textContent = message || "Something went wrong.";
+    toast.classList.add("show");
+
+    clearTimeout(state.toastTimer);
+
+    state.toastTimer = setTimeout(() => {
+        toast.classList.remove("show");
+    }, 3000);
+}
+
+
+/* =========================================================
+   LOADING
+   ========================================================= */
+
+function showLoading() {
+    const loading = $("#loading");
+
+    if (loading) {
+        loading.classList.remove("hidden");
+    }
+}
+
+
+function hideLoading() {
+    const loading = $("#loading");
+
+    if (loading) {
+        loading.classList.add("hidden");
+    }
+}
+
+
+/* =========================================================
+   API
+   ========================================================= */
+
+async function apiRequest(url, options = {}) {
+
+    if (!options.noCache && state.requestCache.has(url)) {
+        return state.requestCache.get(url);
+    }
+
+    const controllerSignal = options.signal;
+
+    const request = fetch(url, {
+        method: "GET",
+        headers: {
+            "Accept": "application/json"
+        },
+        signal: controllerSignal
+    })
+        .then(async response => {
+
+            let data = null;
+
+            try {
+                data = await response.json();
+            } catch {
+                throw new Error("Server returned invalid JSON.");
+            }
+
+            if (!response.ok) {
+                throw new Error(
+                    data?.detail ||
+                    `Request failed with status ${response.status}.`
+                );
+            }
+
+            return data;
+        });
+
+    if (!options.noCache) {
+        state.requestCache.set(url, request);
+    }
+
+    try {
+        return await request;
+    } catch (error) {
+
+        state.requestCache.delete(url);
+
+        throw error;
+    }
+}
+
+
+/* =========================================================
+   TEXT HELPER
+   ========================================================= */
+
+function setText(selector, value, fallback = "—") {
+
+    const element = $(selector);
+
+    if (!element) {
+        return;
+    }
+
+    if (
+        value === undefined ||
+        value === null ||
+        String(value).trim() === ""
+    ) {
+        element.textContent = fallback;
+        return;
+    }
+
+    element.textContent = value;
+}
+
+
+/* =========================================================
+   MOVIE NORMALIZER
+   ========================================================= */
+
+function normalizeMovie(movie) {
+
+    if (!movie || typeof movie !== "object") {
+        return null;
+    }
+
+    const id = Number(
+        movie.tmdb_id ??
+        movie.id ??
+        0
+    );
+
+    if (!id) {
+        return null;
+    }
+
+    return {
+        tmdb_id: id,
+        title:
+            movie.title ||
+            movie.name ||
+            "Unknown Movie",
+
+        poster:
+            movie.poster ||
+            movie.poster_large ||
+            "",
+
+        poster_large:
+            movie.poster_large ||
+            movie.poster ||
+            "",
+
+        backdrop:
+            movie.backdrop ||
+            "",
+
+        rating:
+            Number(movie.rating || 0),
+
+        year:
+            movie.year ||
+            movie.release_year ||
+            (
+                movie.release_date
+                    ? String(movie.release_date).slice(0, 4)
+                    : "N/A"
+            ),
+
+        runtime:
+            movie.runtime || null,
+
+        overview:
+            movie.overview ||
+            "No overview available.",
+
+        tagline:
+            movie.tagline ||
+            "",
+
+        genres:
+            Array.isArray(movie.genres)
+                ? movie.genres
+                : [],
+
+        director:
+            movie.director ||
+            (
+                Array.isArray(movie.directors)
+                    ? movie.directors.join(", ")
+                    : ""
+            ),
+
+        cast:
+            Array.isArray(movie.cast)
+                ? movie.cast
+                : [],
+
+        trailer_key:
+            movie.trailer_key ||
+            null
+    };
+}
+
+
+/* =========================================================
+   SKELETON
+   ========================================================= */
+
+function createSkeletons(count = 11) {
+
+    return Array.from(
+        { length: count },
+        () => `<div class="skeleton"></div>`
+    ).join("");
+}
+
+
+/* =========================================================
+   MOVIE CARD
+   ========================================================= */
+
+function createMovieCard(movie) {
+
+    const item = normalizeMovie(movie);
+
+    if (!item || !item.tmdb_id || !item.poster) {
+        return "";
+    }
+
+    const title = escapeHtml(item.title);
+    const poster = escapeHtml(item.poster);
+
+    const rating = Number.isFinite(item.rating)
+        ? item.rating.toFixed(1)
+        : "0.0";
+
+    const year = escapeHtml(
+        item.year || "N/A"
+    );
+
+    return `
+        <article
+            class="movie-card"
+            data-movie-id="${item.tmdb_id}"
+            tabindex="0"
+            role="button"
+            aria-label="Open ${title}"
+        >
+
+            <div class="poster-wrap">
+
+                <img
+                    class="poster"
+                    src="${poster}"
+                    alt="${title} poster"
+                    loading="lazy"
+                    onerror="this.style.display='none'"
+                >
+
+                <span class="rating-badge">
+                    ★ ${rating}
+                </span>
+
+                <div class="poster-overlay">
+                    <span class="view-label">
+                        View Details →
+                    </span>
+                </div>
+
+            </div>
+
+            <div class="card-info">
+
+                <h3
+                    class="card-title"
+                    title="${title}"
+                >
+                    ${title}
+                </h3>
+
+                <div class="card-meta">
+                    <span>${year}</span>
+                    <span>•</span>
+                    <span>TMDB</span>
+                </div>
+
+            </div>
+
+        </article>
+    `;
+}
+
+
+/* =========================================================
+   RENDER MOVIES
+   ========================================================= */
+
+function renderMovies(container, movies) {
+
+    if (!container) {
+        return;
+    }
+
+    const list = Array.isArray(movies)
+        ? movies
+            .map(normalizeMovie)
+            .filter(Boolean)
+        : [];
+
+    if (!list.length) {
+
+        container.innerHTML = `
+            <div
+                style="
+                    grid-column:1/-1;
+                    padding:30px 0;
+                    color:#6b7280;
+                "
+            >
+                No movies found.
+            </div>
+        `;
+
+        return;
+    }
+
+    container.innerHTML = list
+        .map(createMovieCard)
+        .filter(Boolean)
+        .join("");
+}
+
+
+/* =========================================================
+   HOME MOVIES
+   ========================================================= */
+
+async function loadHomeMovies() {
+
+    const grid = $("#homeGrid");
+
+    if (!grid) {
+        return;
+    }
+
+    grid.innerHTML = createSkeletons(12);
+
+    try {
+
+        const data = await apiRequest(
+            `${API}/home`
+        );
+
+        renderMovies(
+            grid,
+            data?.movies || []
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Home movies error:",
+            error
+        );
+
+        grid.innerHTML = `
+            <div
+                style="
+                    grid-column:1/-1;
+                    padding:30px 0;
+                    color:#6b7280;
+                "
+            >
+                Unable to load movies.
+            </div>
+        `;
+
+        showToast(
+            friendlyError(error)
+        );
+    }
+}
+
+
+/* =========================================================
+   TRENDING
+   ========================================================= */
+
+async function loadTrendingMovies() {
+
+    const grid = $("#trendingGrid");
+
+    if (!grid) {
+        return;
+    }
+
+    grid.innerHTML = createSkeletons(12);
+
+    try {
+
+        const data = await apiRequest(
+            `${API}/trending`
+        );
+
+        renderMovies(
+            grid,
+            data?.movies || []
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Trending movies error:",
+            error
+        );
+
+        grid.innerHTML = `
+            <div
+                style="
+                    grid-column:1/-1;
+                    padding:30px 0;
+                    color:#6b7280;
+                "
+            >
+                Unable to load trending movies.
+            </div>
+        `;
+    }
+}
+
+
+/* =========================================================
+   SEARCH
+   ========================================================= */
+
+async function searchMovies() {
+
+    const input = $("#searchInput");
+
+    if (!input) {
+        return;
+    }
+
+    const query = input.value.trim();
+
+    if (!query) {
+
+        $("#searchSection")
+            ?.classList.add("hidden");
+
+        return;
+    }
+
+    if (state.searchController) {
+        state.searchController.abort();
+    }
+
+    state.searchController =
+        new AbortController();
+
+    const section = $("#searchSection");
+    const grid = $("#searchGrid");
+    const title = $("#searchTitle");
+
+    section?.classList.remove("hidden");
+
+    if (title) {
+        title.textContent =
+            `Results for "${query}"`;
+    }
+
+    if (grid) {
+        grid.innerHTML =
+            createSkeletons(8);
+    }
+
+    try {
+
+        const data = await apiRequest(
+            `${API}/search?q=${encodeURIComponent(query)}`,
+            {
+                signal:
+                    state.searchController.signal,
+                noCache: true
+            }
+        );
+
+        renderMovies(
+            grid,
+            data?.movies || []
+        );
+
+        section?.scrollIntoView({
+            behavior: "smooth",
+            block: "start"
+        });
+
+    } catch (error) {
+
+        if (error?.name === "AbortError") {
+            return;
+        }
+
+        console.error(
+            "Search error:",
+            error
+        );
+
+        if (grid) {
+
+            grid.innerHTML = `
+                <div
+                    style="
+                        grid-column:1/-1;
+                        padding:30px 0;
+                        color:#6b7280;
+                    "
+                >
+                    Search failed.
+                    Please try again.
+                </div>
+            `;
+        }
+
+        showToast(
+            friendlyError(error)
+        );
+    }
+}
+
+
+/* =========================================================
+   MODAL
+   ========================================================= */
+
+function openMovieModal() {
+
+    const modal = $("#movieModal");
+
+    if (!modal) {
+        return;
+    }
+
+    modal.classList.remove("hidden");
+
+    modal.setAttribute(
+        "aria-hidden",
+        "false"
+    );
+
+    document.body.style.overflow =
+        "hidden";
+}
+
+
+function closeMovieModal() {
+
+    const modal = $("#movieModal");
+
+    if (!modal) {
+        return;
+    }
+
+    modal.classList.add("hidden");
+
+    modal.setAttribute(
+        "aria-hidden",
+        "true"
+    );
+
+    document.body.style.overflow = "";
+}
+
+
+/* =========================================================
+   REMOVE OLD RECOMMEND BUTTON
+   ========================================================= */
+
+function removeRecommendationButton() {
+
+    const button =
+        $("#recommendBtn");
+
+    if (button) {
+        button.remove();
+    }
+}
+
+
+/* =========================================================
+   MOVE RECOMMENDATIONS INTO MODAL
+   ========================================================= */
+
+function moveRecommendationsIntoModal() {
+
+    const modalPanel =
+        document.querySelector(
+            "#movieModal .modal-panel"
+        );
+
+    const recommendationSection =
+        $("#recommendations");
+
+    if (
+        !modalPanel ||
+        !recommendationSection
+    ) {
+        return false;
+    }
+
+    if (
+        recommendationSection.parentElement !==
+        modalPanel
+    ) {
+        modalPanel.appendChild(
+            recommendationSection
+        );
+    }
+
+    recommendationSection.classList.remove(
+        "hidden"
+    );
+
+    recommendationSection.setAttribute(
+        "data-inside-modal",
+        "true"
+    );
+
+    removeRecommendationButton();
+
+    return true;
+}
+
+
+/* =========================================================
+   RESET MOVIE MODAL
+   ========================================================= */
+
+function resetModal() {
+
+    setText(
+        "#modalTitle",
+        "Loading...",
+        "Loading..."
+    );
+
+    setText(
+        "#modalRating",
+        "0.0",
+        "0.0"
+    );
+
+    setText(
+        "#modalYear",
+        "N/A",
+        "N/A"
+    );
+
+    setText(
+        "#modalRuntime",
+        "",
+        ""
+    );
+
+    setText(
+        "#modalTagline",
+        "",
+        ""
+    );
+
+    setText(
+        "#modalOverview",
+        "Loading movie information...",
+        "Loading movie information..."
+    );
+
+    setText(
+        "#modalDirector",
+        "",
+        "Not available"
+    );
+
+    setText(
+        "#modalCast",
+        "",
+        "Not available"
+    );
+
+    const poster =
+        $("#modalPoster");
+
+    if (poster) {
+        poster.removeAttribute("src");
+        poster.alt = "";
+    }
+
+    const cover =
+        $("#modalCoverBg");
+
+    if (cover) {
+        cover.style.backgroundImage =
+            "none";
+    }
+
+    const genres =
+        $("#modalGenres");
+
+    if (genres) {
+        genres.innerHTML = "";
+    }
+
+    const trailer =
+        $("#trailerBtn");
+
+    if (trailer) {
+        trailer.hidden = true;
+    }
+}
+
+
+/* =========================================================
+   LOAD MOVIE DETAILS
+   ========================================================= */
+
+async function openMovie(movieId) {
+
+    const id = Number(movieId);
+
+    if (
+        !Number.isInteger(id) ||
+        id <= 0
+    ) {
+        return;
+    }
+
+    if (state.movieController) {
+        state.movieController.abort();
+    }
+
+    if (state.recommendationController) {
+        state.recommendationController.abort();
+    }
+
+    state.movieController =
+        new AbortController();
+
+    state.recommendationRequestId++;
+
+    moveRecommendationsIntoModal();
+
+    resetModal();
+
+    openMovieModal();
+
+    const panel =
+        document.querySelector(
+            "#movieModal .modal-panel"
+        );
+
+    if (panel) {
+        panel.scrollTop = 0;
+    }
+
+    try {
+
+        const movie = await apiRequest(
+            `${API}/movie/${id}`,
+            {
+                signal:
+                    state.movieController.signal
+            }
+        );
+
+        if (!movie) {
+            throw new Error(
+                "Movie details were not found."
+            );
+        }
+
+        state.currentMovie =
+            normalizeMovie(movie);
+
+        const current =
+            state.currentMovie;
+
+        /* ---------- DETAILS ---------- */
+
+        setText(
+            "#modalTitle",
+            current.title,
+            "Unknown Movie"
+        );
+
+        const rating =
+            Number(current.rating || 0);
+
+        setText(
+            "#modalRating",
+            Number.isFinite(rating)
+                ? rating.toFixed(1)
+                : "0.0",
+            "0.0"
+        );
+
+        setText(
+            "#modalYear",
+            current.year,
+            "N/A"
+        );
+
+        setText(
+            "#modalRuntime",
+            current.runtime
+                ? `${current.runtime} min`
+                : "",
+            ""
+        );
+
+        setText(
+            "#modalTagline",
+            current.tagline,
+            ""
+        );
+
+        setText(
+            "#modalOverview",
+            current.overview,
+            "No overview available."
+        );
+
+        /* ---------- POSTER ---------- */
+
+        const poster =
+            $("#modalPoster");
+
+        if (poster) {
+
+            poster.src =
+                current.poster_large ||
+                current.poster ||
+                "";
+
+            poster.alt =
+                `${current.title} poster`;
+        }
+
+        /* ---------- BACKDROP ---------- */
+
+        const cover =
+            $("#modalCoverBg");
+
+        if (cover) {
+
+            if (current.backdrop) {
+
+                cover.style.backgroundImage =
+                    `url("${current.backdrop}")`;
+
+            } else {
+
+                cover.style.backgroundImage =
+                    "none";
+            }
+        }
+
+        /* ---------- GENRES ---------- */
+
+        const genres =
+            $("#modalGenres");
+
+        if (genres) {
+
+            genres.innerHTML =
+                current.genres
+                    .filter(Boolean)
+                    .map(
+                        genre =>
+                            `
+                            <span class="chip">
+                                ${escapeHtml(genre)}
+                            </span>
+                            `
+                    )
+                    .join("");
+        }
+
+        /* ---------- DIRECTOR ---------- */
+
+        setText(
+            "#modalDirector",
+            current.director,
+            "Not available"
+        );
+
+        /* ---------- CAST ---------- */
+
+        const cast =
+            current.cast
+                .slice(0, 6)
+                .map(person => {
+
+                    if (
+                        typeof person ===
+                        "string"
+                    ) {
+                        return person;
+                    }
+
+                    return person?.name;
+                })
+                .filter(Boolean)
+                .join(", ");
+
+        setText(
+            "#modalCast",
+            cast,
+            "Not available"
+        );
+
+        /* ---------- TRAILER ---------- */
+
+        const trailer =
+            $("#trailerBtn");
+
+        if (trailer) {
+
+            trailer.hidden =
+                !current.trailer_key;
+        }
+
+        /* =================================================
+           IMPORTANT:
+           AUTOMATIC RECOMMENDATIONS
+           ================================================= */
+
+        await loadRecommendations(
+            current
+        );
+
+    } catch (error) {
+
+        if (
+            error?.name ===
+            "AbortError"
+        ) {
+            return;
+        }
+
+        console.error(
+            "Movie details error:",
+            error
+        );
+
+        closeMovieModal();
+
+        showToast(
+            friendlyError(error)
+        );
+    }
+}
+
+
+/* =========================================================
+   RECOMMENDATION AREA
+   ========================================================= */
+
+function prepareRecommendationArea(
+    movie
+) {
+
+    moveRecommendationsIntoModal();
+
+    const section =
+        $("#recommendations");
+
+    const grid =
+        $("#recommendationGrid");
+
+    if (!section || !grid) {
+        return null;
+    }
+
+    section.classList.remove(
+        "hidden"
+    );
+
+    setText(
+        "#basedOn",
+        movie.title,
+        "this movie"
+    );
+
+    grid.innerHTML =
+        createSkeletons(11);
+
+    return {
+        section,
+        grid
+    };
+}
+
+
+/* =========================================================
+   LOAD 11 AI RECOMMENDATIONS
+   ========================================================= */
+
+async function loadRecommendations(
+    movie
+) {
+
+    if (
+        !movie ||
+        !movie.title
+    ) {
+        return;
+    }
+
+    const area =
+        prepareRecommendationArea(
+            movie
+        );
+
+    if (!area) {
+        return;
+    }
+
+    const {
+        section,
+        grid
+    } = area;
+
+    if (
+        state.recommendationController
+    ) {
+        state.recommendationController.abort();
+    }
+
+    state.recommendationController =
+        new AbortController();
+
+    const requestId =
+        ++state.recommendationRequestId;
+
+    try {
+
+        const data =
+            await apiRequest(
+                `${API}/recommendations?title=${encodeURIComponent(
+                    movie.title
+                )}`,
+                {
+                    signal:
+                        state.recommendationController.signal
+                }
+            );
+
+        if (
+            requestId !==
+            state.recommendationRequestId
+        ) {
+            return;
+        }
+
+        const selectedId =
+            Number(
+                movie.tmdb_id ||
+                movie.id ||
+                0
+            );
+
+        const selectedTitle =
+            String(
+                movie.title || ""
+            )
+                .trim()
+                .toLowerCase();
+
+        const recommendations =
+            (
+                Array.isArray(data?.movies)
+                    ? data.movies
+                    : []
+            )
+                .map(normalizeMovie)
+                .filter(Boolean)
+                .filter(item => {
+
+                    const sameId =
+                        selectedId > 0 &&
+                        Number(item.tmdb_id) ===
+                        selectedId;
+
+                    const sameTitle =
+                        String(item.title)
+                            .trim()
+                            .toLowerCase() ===
+                        selectedTitle;
+
+                    return (
+                        !sameId &&
+                        !sameTitle
+                    );
+                })
+                .slice(0, 11);
+
+        renderMovies(
+            grid,
+            recommendations
+        );
+
+        section.classList.remove(
+            "hidden"
+        );
+
+    } catch (error) {
+
+        if (
+            error?.name ===
+            "AbortError"
+        ) {
+            return;
+        }
+
+        console.error(
+            "Recommendation error:",
+            error
+        );
+
+        grid.innerHTML = `
+            <div
+                style="
+                    grid-column:1/-1;
+                    padding:25px 0;
+                    color:#6b7280;
+                "
+            >
+                Recommendations could not
+                be loaded.
+            </div>
+        `;
+
+        showToast(
+            friendlyError(error)
+        );
+    }
+}
+
+
+/* =========================================================
+   NAVIGATION
+   ========================================================= */
+
+function scrollToSection(id) {
+
+    const element =
+        document.getElementById(id);
+
+    if (!element) {
+        return;
+    }
+
+    element.scrollIntoView({
+        behavior: "smooth",
+        block: "start"
+    });
+}
+
+
+function setupNavigation() {
+
+    $("#homeBtn")
+        ?.addEventListener(
+            "click",
+            () => scrollToSection("home")
+        );
+
+    $("#exploreBtn")
+        ?.addEventListener(
+            "click",
+            () => scrollToSection("popular")
+        );
+
+    document
+        .querySelectorAll(
+            "[data-scroll]"
+        )
+        .forEach(button => {
+
+            button.addEventListener(
+                "click",
+                () => {
+
+                    const target =
+                        button.dataset.scroll;
+
+                    if (target) {
+                        scrollToSection(
+                            target
+                        );
+                    }
+                }
+            );
+        });
+}
+
+
+/* =========================================================
+   SEARCH EVENTS
+   ========================================================= */
+
+function setupSearch() {
+
+    const input =
+        $("#searchInput");
+
+    const searchButton =
+        $("#searchBtn");
+
+    const clearButton =
+        $("#clearSearch");
+
+    searchButton?.addEventListener(
+        "click",
+        searchMovies
+    );
+
+    input?.addEventListener(
+        "keydown",
+        event => {
+
+            if (
+                event.key ===
+                "Enter"
+            ) {
+
+                event.preventDefault();
+
+                searchMovies();
+            }
+        }
+    );
+
+    input?.addEventListener(
+        "input",
+        () => {
+
+            if (!clearButton) {
+                return;
+            }
+
+            clearButton.style.display =
+                input.value.trim()
+                    ? "block"
+                    : "none";
+        }
+    );
+
+    clearButton?.addEventListener(
+        "click",
+        () => {
+
+            if (input) {
+                input.value = "";
+                input.focus();
+            }
+
+            clearButton.style.display =
+                "none";
+
+            $("#searchSection")
+                ?.classList.add(
+                    "hidden"
+                );
+        }
+    );
+}
+
+
+/* =========================================================
+   MOVIE CARD EVENTS
+   ========================================================= */
+
+function setupMovieCards() {
+
+    document.addEventListener(
+        "click",
+        event => {
+
+            const card =
+                event.target.closest(
+                    ".movie-card"
+                );
+
+            if (!card) {
+                return;
+            }
+
+            event.preventDefault();
+
+            const movieId =
+                card.dataset.movieId;
+
+            if (movieId) {
+                openMovie(movieId);
+            }
+        }
+    );
+
+
+    document.addEventListener(
+        "keydown",
+        event => {
+
+            const card =
+                event.target.closest(
+                    ".movie-card"
+                );
+
+            if (!card) {
+                return;
+            }
+
+            if (
+                event.key === "Enter" ||
+                event.key === " "
+            ) {
+
+                event.preventDefault();
+
+                const movieId =
+                    card.dataset.movieId;
+
+                if (movieId) {
+                    openMovie(movieId);
+                }
+            }
+        }
+    );
+}
+
+
+/* =========================================================
+   MODAL EVENTS
+   ========================================================= */
+
+function setupModal() {
+
+    $("#modalClose")
+        ?.addEventListener(
+            "click",
+            closeMovieModal
+        );
+
+    $("#modalBackdrop")
+        ?.addEventListener(
+            "click",
+            closeMovieModal
+        );
+
+    /*
+       IMPORTANT:
+       Old recommendation button is removed.
+    */
+
+    removeRecommendationButton();
+
+    $("#trailerBtn")
+        ?.addEventListener(
+            "click",
+            () => {
+
+                const key =
+                    state.currentMovie
+                        ?.trailer_key;
+
+                if (!key) {
+
+                    showToast(
+                        "Trailer is not available."
+                    );
+
+                    return;
+                }
+
+                window.open(
+                    `https://www.youtube.com/watch?v=${encodeURIComponent(
+                        key
+                    )}`,
+                    "_blank",
+                    "noopener,noreferrer"
+                );
+            }
+        );
+
+
+    document.addEventListener(
+        "keydown",
+        event => {
+
+            if (
+                event.key ===
+                "Escape"
+            ) {
+                closeMovieModal();
+            }
+        }
+    );
+}
+
+
+/* =========================================================
+   REMOVE OLD BUTTON IF HTML/OTHER CODE ADDS IT
+   ========================================================= */
+
+function watchForOldRecommendButton() {
+
+    const modal =
+        $("#movieModal");
+
+    if (!modal) {
+        return;
+    }
+
+    const observer =
+        new MutationObserver(() => {
+
+            removeRecommendationButton();
+
+        });
+
+    observer.observe(
+        modal,
+        {
+            childList: true,
+            subtree: true
+        }
+    );
+}
+
+
+/* =========================================================
+   INITIALIZE
+   ========================================================= */
+
+async function initializeApp() {
+
+    /*
+       Move recommendation section
+       before anything else.
+    */
+
+    moveRecommendationsIntoModal();
+
+    removeRecommendationButton();
+
+    setupNavigation();
+    setupSearch();
+    setupMovieCards();
+    setupModal();
+    watchForOldRecommendButton();
+
+    showLoading();
+
+    try {
+
+        await Promise.all([
+            loadHomeMovies(),
+            loadTrendingMovies()
+        ]);
+
+    } finally {
+
+        hideLoading();
+    }
+}
+
+
+/* =========================================================
+   START
+   ========================================================= */
+
+if (
+    document.readyState ===
+    "loading"
+) {
+
+    document.addEventListener(
+        "DOMContentLoaded",
+        initializeApp,
+        { once: true }
+    );
+
+} else {
+
+    initializeApp();
+}
