@@ -1836,3 +1836,119 @@ if (
 
     initializeApp();
 }
+
+/* =========================================================
+   DARK MODE
+   Uses existing #themeToggle from index.html
+   ========================================================= */
+
+function setupDarkMode() {
+
+    const DARK_MODE_KEY = "moviemind-theme";
+
+    const themeToggle =
+        document.getElementById("themeToggle");
+
+    const themeIcon =
+        document.getElementById("themeIcon");
+
+    if (!themeToggle) {
+        console.warn(
+            "Dark mode button #themeToggle not found."
+        );
+        return;
+    }
+
+    function applyTheme(isDark) {
+
+        /*
+         * IMPORTANT:
+         * CSS uses html.dark-mode,
+         * so the class MUST be added to <html>,
+         * not <body>.
+         */
+        document.documentElement.classList.toggle(
+            "dark-mode",
+            isDark
+        );
+
+        if (themeIcon) {
+            themeIcon.textContent =
+                isDark ? "☀" : "☾";
+        }
+
+        themeToggle.setAttribute(
+            "aria-label",
+            isDark
+                ? "Switch to light mode"
+                : "Switch to dark mode"
+        );
+
+        themeToggle.setAttribute(
+            "title",
+            isDark
+                ? "Switch to light mode"
+                : "Switch to dark mode"
+        );
+
+        themeToggle.setAttribute(
+            "aria-pressed",
+            String(isDark)
+        );
+    }
+
+    /*
+     * Load previously saved theme.
+     */
+    const savedTheme =
+        localStorage.getItem(DARK_MODE_KEY);
+
+    applyTheme(savedTheme === "dark");
+
+    /*
+     * Existing button only.
+     * No new button is created.
+     */
+    themeToggle.addEventListener(
+        "click",
+        () => {
+
+            const isDark =
+                !document.documentElement.classList.contains(
+                    "dark-mode"
+                );
+
+            applyTheme(isDark);
+
+            localStorage.setItem(
+                DARK_MODE_KEY,
+                isDark
+                    ? "dark"
+                    : "light"
+            );
+        }
+    );
+}
+
+
+/* =========================================================
+   START DARK MODE
+   ========================================================= */
+
+if (
+    document.readyState === "loading"
+) {
+
+    document.addEventListener(
+        "DOMContentLoaded",
+        setupDarkMode,
+        {
+            once: true
+        }
+    );
+
+} else {
+
+    setupDarkMode();
+
+}
